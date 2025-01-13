@@ -1,32 +1,12 @@
 import sys
 import os
-
 import torch
 import torch.distributed as dist
 import time
-from strassen import run_strassen_2_layer_fp32_accum, run_strassen_fp32_accum, run_matmul_fp32_accum
-
-def init_distributed():
-    """Initialize distributed environment"""
-    if 'RANK' not in os.environ:
-        os.environ['RANK'] = '0'
-    if 'WORLD_SIZE' not in os.environ:
-        os.environ['WORLD_SIZE'] = '4'
-    if 'MASTER_ADDR' not in os.environ:
-        os.environ['MASTER_ADDR'] = 'localhost'
-    if 'MASTER_PORT' not in os.environ:
-        os.environ['MASTER_PORT'] = '29500'
-
-    dist.init_process_group(
-        backend='nccl',
-        init_method='env://',
-        world_size=int(os.environ['WORLD_SIZE']),
-        rank=int(os.environ['RANK'])
-    )
+from strassen import run_strassen_fp32_accum, run_matmul_fp32_accum, run_winograd_strassen
 
 class DataDistributed:
-    def __call__(self, a: torch.Tensor, b: torch.Tensor, func, three: bool = False) -> torch.Tensor:
-        # Move tensors to GPU
+    def __call__(self, a: torch.Tensor, b: torch.Tensor, func, three: bool = True) -> torch.Tensor:
         a = a.cuda()
         b = b.cuda()
         
@@ -35,7 +15,6 @@ class DataDistributed:
             func(a, b, c)
             return c
         else:
-            # For functions like torch.matmul that only take 2 arguments
             return func(a, b)
 
 def benchmark_matmul(
@@ -55,114 +34,120 @@ def benchmark_matmul(
     dd = DataDistributed()
 
     for _ in range(num_warmup):
-        dd(a, b, run_strassen_2_layer_fp32_accum, three=True)
         dd(a, b, run_strassen_fp32_accum, three=True)
+        dd(a, b, run_winograd_strassen, three=True)
         dd(a, b, run_matmul_fp32_accum, three=True)
-        dd(a, b, torch.matmul, three=False)  # Explicitly set three=False for torch.matmul
+        dd(a, b, torch.matmul, three=False)
 
     torch.cuda.synchronize()
 
-    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_runs)]
-    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_runs)]
-
-
-    for i in range(num_runs):
-        torch.cuda._sleep(1_000_000)
-        start_events[i].record()
-        dd(a, b, run_strassen_2_layer_fp32_accum, three=True)
-        # run_strassen_2_layer_fp32_accum(a, b, c, 64)
-        end_events[i].record()
-
-    torch.cuda.synchronize()
-    torch.cuda.empty_cache()
-    triton_strassen2_times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
-
-    max_diff = torch.max(torch.abs(c - gt_mm)).item()
-
-
+    # Time Strassen
     start_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_runs)]
     end_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_runs)]
 
     for i in range(num_runs):
-        c.zero_()
         torch.cuda._sleep(1_000_000)
         start_events[i].record()
         dd(a, b, run_strassen_fp32_accum, three=True)
-        # run_strassen_fp32_accum(a, b, c)
         end_events[i].record()
 
-    torch.cuda.synchronize()        
+    torch.cuda.synchronize()
     torch.cuda.empty_cache()
     triton_strassen_times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
 
-
+    # Time Winograd Strassen
     start_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_runs)]
     end_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_runs)]
 
-    triton_mm_times = []
     for i in range(num_runs):
-        c.zero_()
+        torch.cuda._sleep(1_000_000)
+        start_events[i].record()
+        dd(a, b, run_winograd_strassen, three=True)
+        end_events[i].record()
+
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    winograd_times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
+
+    # Time Triton MM
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_runs)]
+    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_runs)]
+
+    for i in range(num_runs):
         torch.cuda._sleep(1_000_000)
         start_events[i].record()
         dd(a, b, run_matmul_fp32_accum, three=True)
-        # run_matmul_fp32_accum(a, b, c)
         end_events[i].record()
 
-    torch.cuda.synchronize()        
+    torch.cuda.synchronize()
     torch.cuda.empty_cache()
     triton_mm_times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
 
-    torch_times = []
+    # Time PyTorch
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_runs)]
+    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_runs)]
+
     for i in range(num_runs):
-        c.zero_()
         torch.cuda._sleep(1_000_000)
         start_events[i].record()
         dd(a, b, torch.matmul, three=False)
-        # torch.matmul(a, b)
         end_events[i].record()
 
-    torch.cuda.synchronize()        
+    torch.cuda.synchronize()
     torch.cuda.empty_cache()
     torch_times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
 
-    triton_strassen2_avg = sum(triton_strassen2_times) / len(triton_strassen2_times)
+    # Calculate statistics
     triton_strassen_avg = sum(triton_strassen_times) / len(triton_strassen_times)
+    winograd_avg = sum(winograd_times) / len(winograd_times)
     triton_mm_avg = sum(triton_mm_times) / len(triton_mm_times)
     torch_avg = sum(torch_times) / len(torch_times)
 
-    triton_strassen2_min = min(triton_strassen2_times)
     triton_strassen_min = min(triton_strassen_times)
+    winograd_min = min(winograd_times)
     triton_mm_min = min(triton_mm_times)
     torch_min = min(torch_times)
 
     results = {
-        "triton_strassen2_mean_ms": triton_strassen2_avg * 1000,
-        "triton_strassen_mean_ms": triton_strassen_avg * 1000,
-        "triton_mm_mean_ms": triton_mm_avg * 1000,
-        "torch_mean_ms": torch_avg * 1000,
-        "triton_strassen2_min_ms": triton_strassen2_min * 1000,
-        "triton_strassen_min_ms": triton_strassen_min * 1000,
-        "triton_mm_min_ms": triton_mm_min * 1000,
-        "torch_min_ms": torch_min * 1000,
-        "triton_strassen2_tflops": (2 * M * N * K) / (triton_strassen2_min * 1e12 + 1e-6),
+        "triton_strassen_mean_ms": triton_strassen_avg,
+        "winograd_mean_ms": winograd_avg,
+        "triton_mm_mean_ms": triton_mm_avg,
+        "torch_mean_ms": torch_avg,
+        "triton_strassen_min_ms": triton_strassen_min,
+        "winograd_min_ms": winograd_min,
+        "triton_mm_min_ms": triton_mm_min,
+        "torch_min_ms": torch_min,
         "triton_strassen_tflops": (2 * M * N * K) / (triton_strassen_min * 1e12 + 1e-6),
+        "winograd_tflops": (2 * M * N * K) / (winograd_min * 1e12 + 1e-6),
         "triton_mm_tflops": (2 * M * N * K) / (triton_mm_min * 1e12 + 1e-6),
         "torch_tflops": (2 * M * N * K) / (torch_min * 1e12 + 1e-6),
-        "strassen2_max_diff": max_diff,
-        "strassen2_mean_speedup": torch_avg / triton_strassen2_avg,
         "strassen_mean_speedup": torch_avg / triton_strassen_avg,
+        "winograd_mean_speedup": torch_avg / winograd_avg,
         "triton_mm_mean_speedup": torch_avg / triton_mm_avg
     }
 
     return results
 
-
 def profile_mats():
+    sizes = [8192]
 
-    sizes = [8192, 16384, 32768, 65536]
-
-    print(f"{'Size':>6}| {'Strassen2':>10} | {'Strassen':>10} | {'Triton_MM':>10} | {'PyTorch':>10} | {'Strassen2_Speedup':>8} | {'Strassen_Speedup':>8} | {'Triton Speedup':>8} | {'Max Diff':>8} | {'TF/s':>6}")
-    print("-" * 100)
+    headers = [
+        "Size",
+        "Strassen (ms)",
+        "Winograd (ms)",
+        "Triton_MM (ms)",
+        "PyTorch (ms)",
+        "Strassenx",
+        "Winogradx",
+        "Tritonx",
+        "TF/s"
+    ]
+    
+    fmt = "{:>8} | {:>13.3f} | {:>13.3f} | {:>13.3f} | {:>13.3f} | {:>9.3f} | {:>9.3f} | {:>9.3f} | {:>6.2f}"
+    header_fmt = "{:>8} | {:>13} | {:>13} | {:>13} | {:>13} | {:>9} | {:>9} | {:>9} | {:>6}"
+    
+    print(header_fmt.format(*headers))
+    print("-" * 110)
 
     for size in sizes:
         results = benchmark_matmul(
@@ -170,18 +155,18 @@ def profile_mats():
             num_warmup=10,
             num_runs=50
         )
-
-        print(f"{size:>6} | "
-              f"{results['triton_strassen2_mean_ms']:>10.3f} | "
-              f"{results['triton_strassen_mean_ms']:>10.3f} | "
-              f"{results['triton_mm_mean_ms']:>10.3f} | "
-              f"{results['torch_mean_ms']:>10.3f} | "
-              f"{results['strassen2_mean_speedup']:>8.3f}x | "
-              f"{results['strassen_mean_speedup']:>8.3f}x | "
-              f"{results['triton_mm_mean_speedup']:>8.3f}x | "
-              f"{results['strassen2_max_diff']:>10.3e} | "
-              f"{results['triton_strassen2_tflops']:>8.3f} ") # f"{results['triton_mm_tflops']:>8.3f} "
-
+        
+        print(fmt.format(
+            size,
+            results['triton_strassen_mean_ms'],
+            results['winograd_mean_ms'],
+            results['triton_mm_mean_ms'],
+            results['torch_mean_ms'],
+            results['strassen_mean_speedup'],
+            results['winograd_mean_speedup'],
+            results['triton_mm_mean_speedup'],
+            results['winograd_tflops']
+        ))
 
 if __name__ == "__main__":
     print(torch.cuda.is_available())

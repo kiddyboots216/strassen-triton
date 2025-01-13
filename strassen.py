@@ -515,5 +515,106 @@ def matmul_test() -> None:
     print(c)
     assert torch.allclose(a @ b, c, atol=1e-6), "did not match gt"
 
+@triton.jit
+def winograd_strassen_kernel_fp32_accum(
+        A_ptr, B_ptr, C_ptr,
+        M, N, K,
+        A_stride_m, A_stride_k,
+        BLOCK_SIZE: tl.constexpr,
+        HALF_BLOCK: tl.constexpr):  # Removed USE_STRASSEN
+    
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    base_m = pid_m * BLOCK_SIZE
+    base_n = pid_n * BLOCK_SIZE
+
+    acc_11 = tl.zeros((HALF_BLOCK, HALF_BLOCK), dtype=tl.float32)
+    acc_12 = tl.zeros((HALF_BLOCK, HALF_BLOCK), dtype=tl.float32)
+    acc_21 = tl.zeros((HALF_BLOCK, HALF_BLOCK), dtype=tl.float32)
+    acc_22 = tl.zeros((HALF_BLOCK, HALF_BLOCK), dtype=tl.float32)
+
+    row_offs1 = base_m + tl.arange(0, HALF_BLOCK)
+    row_offs2 = base_m + HALF_BLOCK + tl.arange(0, HALF_BLOCK)
+    col_offs1 = base_n + tl.arange(0, HALF_BLOCK)
+    col_offs2 = base_n + HALF_BLOCK + tl.arange(0, HALF_BLOCK)
+
+    for k in range(0, K, BLOCK_SIZE):
+        k_offs1 = k + tl.arange(0, HALF_BLOCK)
+        k_offs2 = k + HALF_BLOCK + tl.arange(0, HALF_BLOCK)
+
+        # Load in FP16 for better memory bandwidth
+        a_ptrs_11 = A_ptr + row_offs1[:, None] * A_stride_m + k_offs1[None, :]
+        a_ptrs_12 = A_ptr + row_offs1[:, None] * A_stride_m + k_offs2[None, :]
+        a_ptrs_21 = A_ptr + row_offs2[:, None] * A_stride_m + k_offs1[None, :]
+        a_ptrs_22 = A_ptr + row_offs2[:, None] * A_stride_m + k_offs2[None, :]
+
+        A_11 = tl.load(a_ptrs_11, mask=(row_offs1[:, None] < M) & (k_offs1[None, :] < K), other=0.).to(tl.float16)
+        A_12 = tl.load(a_ptrs_12, mask=(row_offs1[:, None] < M) & (k_offs2[None, :] < K), other=0.).to(tl.float16)
+        A_21 = tl.load(a_ptrs_21, mask=(row_offs2[:, None] < M) & (k_offs1[None, :] < K), other=0.).to(tl.float16)
+        A_22 = tl.load(a_ptrs_22, mask=(row_offs2[:, None] < M) & (k_offs2[None, :] < K), other=0.).to(tl.float16)
+
+        b_ptrs_11 = B_ptr + k_offs1[:, None] * A_stride_m + col_offs1[None, :]
+        b_ptrs_12 = B_ptr + k_offs1[:, None] * A_stride_m + col_offs2[None, :]
+        b_ptrs_21 = B_ptr + k_offs2[:, None] * A_stride_m + col_offs1[None, :]
+        b_ptrs_22 = B_ptr + k_offs2[:, None] * A_stride_m + col_offs2[None, :]
+
+        B_11 = tl.load(b_ptrs_11, mask=(k_offs1[:, None] < K) & (col_offs1[None, :] < N), other=0.).to(tl.float16)
+        B_12 = tl.load(b_ptrs_12, mask=(k_offs1[:, None] < K) & (col_offs2[None, :] < N), other=0.).to(tl.float16)
+        B_21 = tl.load(b_ptrs_21, mask=(k_offs2[:, None] < K) & (col_offs1[None, :] < N), other=0.).to(tl.float16)
+        B_22 = tl.load(b_ptrs_22, mask=(k_offs2[:, None] < K) & (col_offs2[None, :] < N), other=0.).to(tl.float16)
+
+        # Winograd variant computations
+        S1 = A_21 + A_22
+        S2 = S1 - A_11
+        S3 = A_11 - A_21
+        S4 = A_12 - S2
+        
+        T1 = B_12 - B_11
+        T2 = B_22 - T1
+        T3 = B_22 - B_12
+        T4 = T2 - B_21
+
+        # Direct matrix multiplications
+        M1 = tl.dot(A_11, T1, allow_tf32=True)
+        M2 = tl.dot(S4, B_22, allow_tf32=True)
+        M3 = tl.dot(S3, T3, allow_tf32=True)
+        M4 = tl.dot(S2, T4, allow_tf32=True)
+        M5 = tl.dot(S1, T1, allow_tf32=True)
+        M6 = tl.dot(A_11, T2, allow_tf32=True)
+        M7 = tl.dot(S4, B_21, allow_tf32=True)
+
+        # Winograd's additions
+        acc_11 += M1 + M4 - M5 + M7
+        acc_12 += M3 + M5
+        acc_21 += M2 + M4
+        acc_22 += M1 - M2 + M3 + M6
+
+    # Store results
+    c_ptrs_11 = C_ptr + row_offs1[:, None] * A_stride_m + col_offs1[None, :] * A_stride_k
+    c_ptrs_12 = C_ptr + row_offs1[:, None] * A_stride_m + col_offs2[None, :] * A_stride_k
+    c_ptrs_21 = C_ptr + row_offs2[:, None] * A_stride_m + col_offs1[None, :] * A_stride_k
+    c_ptrs_22 = C_ptr + row_offs2[:, None] * A_stride_m + col_offs2[None, :] * A_stride_k
+
+    C_11 = tl.load(c_ptrs_11, mask=(row_offs1[:, None] < M) & (col_offs1[None, :] < N), other=0.)
+    C_12 = tl.load(c_ptrs_12, mask=(row_offs1[:, None] < M) & (col_offs2[None, :] < N), other=0.)
+    C_21 = tl.load(c_ptrs_21, mask=(row_offs2[:, None] < M) & (col_offs1[None, :] < N), other=0.)
+    C_22 = tl.load(c_ptrs_22, mask=(row_offs2[:, None] < M) & (col_offs2[None, :] < N), other=0.)
+
+    tl.store(c_ptrs_11, acc_11 + C_11, mask=(row_offs1[:, None] < M) & (col_offs1[None, :] < N))
+    tl.store(c_ptrs_12, acc_12 + C_12, mask=(row_offs1[:, None] < M) & (col_offs2[None, :] < N))
+    tl.store(c_ptrs_21, acc_21 + C_21, mask=(row_offs2[:, None] < M) & (col_offs1[None, :] < N))
+    tl.store(c_ptrs_22, acc_22 + C_22, mask=(row_offs2[:, None] < M) & (col_offs2[None, :] < N))
+
+def run_winograd_strassen(A, B, C, block_size=64):
+    M, N = C.shape
+    K = A.shape[1]
+    assert K == B.shape[0] and A.shape[0] == M and B.shape[1] == N
+    
+    grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE']), 
+                        triton.cdiv(N, meta['BLOCK_SIZE']))
+    winograd_strassen_kernel_fp32_accum[grid](A, B, C, M, N, K,
+                                            A.stride(0), A.stride(1), block_size, block_size // 2)
+
 if __name__ == "__main__":
     strassens_test()
