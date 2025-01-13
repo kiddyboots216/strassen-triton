@@ -129,7 +129,7 @@ def benchmark_matmul(
     return results
 
 def profile_mats():
-    sizes = [8192]
+    sizes = [8192, 16384]
 
     headers = [
         "Size",

@@ -515,13 +515,31 @@ def matmul_test() -> None:
     print(c)
     assert torch.allclose(a @ b, c, atol=1e-6), "did not match gt"
 
+@triton.autotune(
+    configs=[
+        # triton.Config({'BLOCK_SIZE': 32}, num_warps=2),
+        # triton.Config({'BLOCK_SIZE': 32}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 64}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 64}, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 128}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 128}, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 128}, num_warps=16),
+        # triton.Config({'BLOCK_SIZE': 256}, num_warps=8),
+        # triton.Config({'BLOCK_SIZE': 256}, num_warps=16),
+        # triton.Config({'BLOCK_SIZE': 256}, num_warps=32),
+        # triton.Config({'BLOCK_SIZE': 512}, num_warps=16),
+        # triton.Config({'BLOCK_SIZE': 512}, num_warps=32),
+    ],
+    key=['M', 'N', 'K'],
+)
 @triton.jit
 def winograd_strassen_kernel_fp32_accum(
         A_ptr, B_ptr, C_ptr,
         M, N, K,
         A_stride_m, A_stride_k,
-        BLOCK_SIZE: tl.constexpr,
-        HALF_BLOCK: tl.constexpr):  # Removed USE_STRASSEN
+        BLOCK_SIZE: tl.constexpr):
+    
+    HALF_BLOCK: tl.constexpr = BLOCK_SIZE // 2
     
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -606,7 +624,7 @@ def winograd_strassen_kernel_fp32_accum(
     tl.store(c_ptrs_21, acc_21 + C_21, mask=(row_offs2[:, None] < M) & (col_offs1[None, :] < N))
     tl.store(c_ptrs_22, acc_22 + C_22, mask=(row_offs2[:, None] < M) & (col_offs2[None, :] < N))
 
-def run_winograd_strassen(A, B, C, block_size=64):
+def run_winograd_strassen(A, B, C):
     M, N = C.shape
     K = A.shape[1]
     assert K == B.shape[0] and A.shape[0] == M and B.shape[1] == N
@@ -614,7 +632,7 @@ def run_winograd_strassen(A, B, C, block_size=64):
     grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE']), 
                         triton.cdiv(N, meta['BLOCK_SIZE']))
     winograd_strassen_kernel_fp32_accum[grid](A, B, C, M, N, K,
-                                            A.stride(0), A.stride(1), block_size, block_size // 2)
+                                            A.stride(0), A.stride(1))
 
 if __name__ == "__main__":
     strassens_test()
